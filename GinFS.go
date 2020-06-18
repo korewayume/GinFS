@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"html/template"
@@ -14,7 +13,6 @@ import (
 	"os/signal"
 	"path"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -61,10 +59,10 @@ func ipv4FromAddr(addr net.Addr) net.IP {
 	return ip
 }
 
-func siteIPv4() (net.IP, error) {
+func siteIPv4() net.IP {
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return nil, err
+		return nil
 	}
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 {
@@ -75,17 +73,17 @@ func siteIPv4() (net.IP, error) {
 		}
 		addrs, err := iface.Addrs()
 		if err != nil {
-			return nil, err
+			return nil
 		}
 		for _, addr := range addrs {
 			ip := ipv4FromAddr(addr)
 			if ip == nil {
 				continue
 			}
-			return ip, nil
+			return ip
 		}
 	}
-	return nil, errors.New("network unavailable")
+	return nil
 }
 
 func RandomPortAndBaseUrl() (int, string) {
@@ -98,8 +96,8 @@ func RandomPortAndBaseUrl() (int, string) {
 			break
 		}
 	}
-	ip, err := siteIPv4()
-	if err != nil {
+	ip := siteIPv4()
+	if ip == nil {
 		return port, fmt.Sprintf("http://0.0.0.0:%d", port)
 	} else {
 		return port, fmt.Sprintf("http://%s:%d", ip.String(), port)
@@ -118,27 +116,35 @@ func RandomString(length int) string {
 
 func ServeFile(filePath, uri string) gin.HandlerFunc {
 	filename := path.Base(filePath)
-	return func(c *gin.Context) {
-		if c.Request.Method == "POST" {
-			token := strings.TrimSpace(c.PostForm("Token"))
-			if len(token) == 0 {
-				c.HTML(http.StatusBadRequest, "default", gin.H{
-					"action": uri,
-				})
-				return
+	if len(uri) > 0 {
+		return func(c *gin.Context) {
+			if c.Request.Method == "POST" {
+				token := strings.TrimSpace(c.PostForm("Token"))
+				authorized := strings.EqualFold(token, secret)
+				if !authorized {
+					c.HTML(http.StatusUnauthorized, "default", gin.H{
+						"action": uri,
+					})
+					return
+				}
+				c.SetCookie("authorized", "true", 30, "/", "", false, true)
+				c.Redirect(http.StatusFound, uri)
+			} else {
+				value, _ := c.Cookie("authorized")
+				if value == "true" {
+					c.FileAttachment(filePath, filename)
+					return
+				} else {
+					c.HTML(http.StatusOK, "default", gin.H{
+						"action": uri,
+					})
+					return
+				}
 			}
-			authorized := strings.EqualFold(token, secret)
-			if !authorized {
-				c.HTML(http.StatusUnauthorized, "default", gin.H{
-					"action": uri,
-				})
-				return
-			}
+		}
+	} else {
+		return func(c *gin.Context) {
 			c.FileAttachment(filePath, filename)
-		} else {
-			c.HTML(http.StatusOK, "default", gin.H{
-				"action": uri,
-			})
 		}
 	}
 }
@@ -146,29 +152,35 @@ func ServeFile(filePath, uri string) gin.HandlerFunc {
 func RunServer(filePath string) {
 	port, url := RandomPortAndBaseUrl()
 	uri := fmt.Sprintf("/%s", RandomString(5))
+	secretUri := fmt.Sprintf("/%s", RandomString(5))
 
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
 	t, _ := template.New("default").Parse(htmlTmpl)
 	router.SetHTMLTemplate(t)
 
+	router.GET(fmt.Sprintf("%s%s", uri, secretUri), ServeFile(filePath, ""))
 	router.GET(uri, ServeFile(filePath, uri))
 	router.POST(uri, ServeFile(filePath, uri))
 
-	server := &http.Server{
-		Addr:           fmt.Sprintf(":%d", port),
-		Handler:        router,
-		ReadTimeout:    time.Second * 10,
-		WriteTimeout:   time.Second * 10,
-		MaxHeaderBytes: 1 << 20,
+	srv := &http.Server{
+		Addr:         fmt.Sprintf(":%d", port),
+		Handler:      router,
+		ReadTimeout:  time.Second * 10,
+		WriteTimeout: time.Second * 10,
 	}
-	go server.ListenAndServe()
+	go func() {
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			fmt.Println("Shutdown with error:", err)
+			os.Exit(1)
+		}
+	}()
 
-	fmt.Println(fmt.Sprintf("Secret: %s\n%s%s\n", secret, url, uri))
+	fmt.Println(fmt.Sprintf("Secret: %s\n%s%s\n%s%s%s\n", secret, url, uri, url, uri, secretUri))
 	ExecuteCommand(fmt.Sprintf("iptables -A INPUT -p tcp --dport %d -j ACCEPT", port))
 
 	ch := make(chan os.Signal)
-	signal.Notify(ch, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGINT)
+	signal.Notify(ch, os.Interrupt)
 	sig := <-ch
 	fmt.Println("Receive a signal", sig)
 
@@ -176,7 +188,7 @@ func RunServer(filePath string) {
 
 	cxt, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
-	err := server.Shutdown(cxt)
+	err := srv.Shutdown(cxt)
 	if err != nil {
 		fmt.Println("Shutdown with error:", err)
 		os.Exit(1)
@@ -189,7 +201,6 @@ func ExecuteCommand(command string) {
 	var err error
 	err = cmd.Run()
 	if err != nil {
-		fmt.Println("Execute command with error:", err)
 		fmt.Println(command)
 	}
 }
